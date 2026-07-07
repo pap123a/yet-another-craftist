@@ -3,7 +3,7 @@ name: Sync Tasks
 on:
    schedule:
    - cron: '0 * * * *'
-  workflow_dispatch:
+   workflow_dispatch:
 
 concurrency:
   group: craft-todoist-sync
