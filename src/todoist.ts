@@ -2,16 +2,14 @@
  * Todoist integration module
  */
 
-import { TodoistApi } from '@doist/todoist-api-typescript';
+import { TodoistApi } from '@doist/todoist-sdk';
 import { Task, TodoistTask, TodoistProject } from './types';
 import { CONSTANTS } from './constants';
 import { TaskModel } from './models';
-import axios from 'axios';
 
 export class TodoistIntegration {
   private api: TodoistApi;
   private apiToken: string;
-  private syncApiUrl = 'https://api.todoist.com/sync/v9/sync';
 
   constructor(apiToken: string) {
     this.api = new TodoistApi(apiToken);
@@ -19,13 +17,66 @@ export class TodoistIntegration {
   }
 
   /**
+   * Map a raw v1 SDK task (camelCase) to our internal snake_case TodoistTask shape.
+   */
+  private mapSdkTask(item: any): TodoistTask {
+    return {
+      id: item.id,
+      content: item.content,
+      description: item.description || '',
+      project_id: item.projectId,
+      section_id: item.sectionId,
+      parent_id: item.parentId,
+      labels: item.labels || [],
+      priority: item.priority,
+      is_completed: item.checked,
+      completed_at: item.completedAt
+        ? (item.completedAt instanceof Date ? item.completedAt.toISOString() : item.completedAt)
+        : undefined,
+      created_at: item.addedAt
+        ? (item.addedAt instanceof Date ? item.addedAt.toISOString() : item.addedAt)
+        : undefined,
+      updated_at: item.updatedAt
+        ? (item.updatedAt instanceof Date ? item.updatedAt.toISOString() : item.updatedAt)
+        : undefined,
+      due: item.due
+        ? {
+            date: item.due.date,
+            string: item.due.string,
+            lang: item.due.lang,
+            is_recurring: item.due.isRecurring,
+          }
+        : undefined,
+    } as TodoistTask;
+  }
+
+  /**
+   * Map a raw v1 SDK project (camelCase) to our internal snake_case TodoistProject shape.
+   */
+  private mapSdkProject(project: any): TodoistProject {
+    return {
+      id: project.id,
+      name: project.name,
+      parent_id: project.parentId,
+      order: project.childOrder,
+      color: project.color,
+    };
+  }
+
+  /**
    * Fetch all projects from Todoist
    */
   async getAllProjects(): Promise<TodoistProject[]> {
     console.log('Fetching all projects from Todoist...');
-    const projects = await this.api.getProjects();
+    const projects: TodoistProject[] = [];
+    let cursor: string | null = null;
+    do {
+      const response = await this.api.getProjects(cursor ? { cursor } : {});
+      projects.push(...response.results.map((p: any) => this.mapSdkProject(p)));
+      cursor = response.nextCursor;
+    } while (cursor);
     console.log(`Retrieved ${projects.length} projects`);
-    return projects as TodoistProject[];
+    return projects;
   }
 
   /**
@@ -69,32 +120,23 @@ export class TodoistIntegration {
   }
 
   /**
-   * Fetch tasks using Sync API (incremental updates)
+   * Fetch tasks using the unified v1 sync endpoint (incremental updates)
    */
   async syncTasks(syncToken: string = '*'): Promise<{ items: any[]; syncToken: string; fullSync: boolean }> {
     console.log('Syncing tasks from Todoist using Sync API...');
-    
-    try {
-      const response = await axios.post(
-        this.syncApiUrl,
-        {
-          sync_token: syncToken,
-          resource_types: ['items', 'projects']
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${this.apiToken}`,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
 
-      const items = response.data.items || [];
-      const newSyncToken = response.data.sync_token;
-      const fullSync = response.data.full_sync || false;
+    try {
+      const response = await this.api.sync({
+        syncToken,
+        resourceTypes: ['items', 'projects'],
+      });
+
+      const items = response.items || [];
+      const newSyncToken = response.syncToken || syncToken;
+      const fullSync = response.fullSync || false;
 
       console.log(`  Retrieved ${items.length} items (full_sync: ${fullSync})`);
-      
+
       return {
         items,
         syncToken: newSyncToken,
@@ -111,7 +153,7 @@ export class TodoistIntegration {
    */
   convertSyncItemsToTasks(items: any[]): TodoistTask[] {
     return items
-      .filter(item => !item.is_deleted)
+      .filter(item => !item.isDeleted)
       .filter(item => {
         // Exclude tasks with the nosync label
         if (Array.isArray(item.labels)) {
@@ -119,27 +161,7 @@ export class TodoistIntegration {
         }
         return true;
       })
-      .map(item => ({
-        id: item.id,
-        content: item.content,
-        description: item.description || '',
-        project_id: item.project_id,
-        section_id: item.section_id,
-        parent_id: item.parent_id,
-        labels: item.labels || [],
-        priority: item.priority,
-        is_completed: item.checked,
-        completed_at: item.completed_at,
-        created_at: item.added_at,
-        due: item.due ? {
-          date: item.due.date,
-          string: item.due.string,
-          lang: item.due.lang,
-          is_recurring: item.due.is_recurring
-        } : undefined,
-        // Key addition: updated_at from Sync API!
-        updated_at: item.updated_at,
-      } as TodoistTask));
+      .map(item => this.mapSdkTask(item));
   }
 
   /**
@@ -147,9 +169,15 @@ export class TodoistIntegration {
    */
   async getAllTasks(includeCompleted: boolean = true): Promise<TodoistTask[]> {
     console.log('Fetching all tasks from Todoist...');
-    
-    const activeTasks = await this.api.getTasks();
-    let allTasks = [...activeTasks] as TodoistTask[];
+
+    const allTasks: TodoistTask[] = [];
+    let cursor: string | null = null;
+    do {
+      const response = await this.api.getTasks(cursor ? { cursor } : {});
+      allTasks.push(...response.results.map((t: any) => this.mapSdkTask(t)));
+      cursor = response.nextCursor;
+    } while (cursor);
+
     // Filter out tasks with the nosync label
     const filteredTasks = allTasks.filter(task => {
       if (Array.isArray(task.labels)) {
@@ -166,8 +194,27 @@ export class TodoistIntegration {
    */
   async getTasksForProject(projectId: string): Promise<TodoistTask[]> {
     console.log(`Fetching tasks for project ${projectId}...`);
-    const tasks = await this.api.getTasks({ projectId });
-    return tasks as TodoistTask[];
+    const tasks: TodoistTask[] = [];
+    let cursor: string | null = null;
+    do {
+      const response = await this.api.getTasks(cursor ? { projectId, cursor } : { projectId });
+      tasks.push(...response.results.map((t: any) => this.mapSdkTask(t)));
+      cursor = response.nextCursor;
+    } while (cursor);
+    return tasks;
+  }
+
+  /**
+   * Translate our internal snake_case task payload into the v1 SDK's camelCase args.
+   */
+  private toSdkTaskArgs(data: any): any {
+    const args: any = {};
+    if (data.content !== undefined) args.content = data.content;
+    if (data.description !== undefined) args.description = data.description;
+    if (data.due_string !== undefined) args.dueString = data.due_string;
+    if (data.labels !== undefined) args.labels = data.labels;
+    if (data.project_id !== undefined) args.projectId = data.project_id;
+    return args;
   }
 
   /**
@@ -178,18 +225,19 @@ export class TodoistIntegration {
     if (!task.title || task.title.trim() === '') {
       throw new Error(`Cannot create task with empty title. Task ID: ${task.craftId || task.id}`);
     }
-    
+
     console.log(`Creating task in Todoist: ${task.title}`);
-    
+
     const taskData = TaskModel.toTodoist(task);
-    console.log(`  Task data being sent:`, JSON.stringify(taskData, null, 2));
-    
+    const sdkArgs = this.toSdkTaskArgs(taskData);
+    console.log(`  Task data being sent:`, JSON.stringify(sdkArgs, null, 2));
+
     try {
-      const createdTask = await this.api.addTask(taskData as any);
+      const createdTask = await this.api.addTask(sdkArgs);
       console.log(`Task created with ID: ${createdTask.id}`);
-      return createdTask as TodoistTask;
+      return this.mapSdkTask(createdTask);
     } catch (error: any) {
-      console.error(`  Failed with data:`, JSON.stringify(taskData, null, 2));
+      console.error(`  Failed with data:`, JSON.stringify(sdkArgs, null, 2));
       console.error(`  Error details:`, error.message, error.responseData);
       throw error;
     }
@@ -204,11 +252,12 @@ export class TodoistIntegration {
     }
 
     console.log(`Updating Todoist task ${task.todoistId}: ${task.title}`);
-    
+
     const taskData = TaskModel.toTodoist(task);
-    const updatedTask = await this.api.updateTask(task.todoistId, taskData as any);
-    
-    return updatedTask as TodoistTask;
+    const sdkArgs = this.toSdkTaskArgs(taskData);
+    const updatedTask = await this.api.updateTask(task.todoistId, sdkArgs);
+
+    return this.mapSdkTask(updatedTask);
   }
 
   /**
@@ -216,7 +265,7 @@ export class TodoistIntegration {
    */
   async completeTask(todoistId: string): Promise<boolean> {
     console.log(`Completing Todoist task ${todoistId}`);
-    
+
     try {
       await this.api.closeTask(todoistId);
       return true;
@@ -231,7 +280,7 @@ export class TodoistIntegration {
    */
   async reopenTask(todoistId: string): Promise<boolean> {
     console.log(`Reopening Todoist task ${todoistId}`);
-    
+
     try {
       await this.api.reopenTask(todoistId);
       return true;
@@ -246,7 +295,7 @@ export class TodoistIntegration {
    */
   async deleteTask(todoistId: string): Promise<boolean> {
     console.log(`Deleting Todoist task ${todoistId}`);
-    
+
     try {
       await this.api.deleteTask(todoistId);
       return true;
@@ -262,27 +311,27 @@ export class TodoistIntegration {
   convertToTaskObjects(todoistTasks: TodoistTask[]): Task[] {
     const tasks: Task[] = [];
     let skippedEmptyTasks = 0;
-    
+
     for (const todoistTask of todoistTasks) {
       try {
         const task = TaskModel.fromTodoist(todoistTask);
-        
+
         // Validate task has a non-empty title
         if (!task.title || task.title.trim() === '') {
           skippedEmptyTasks++;
           continue;
         }
-        
+
         tasks.push(task);
       } catch (error) {
         console.error(`Failed to convert Todoist task ${todoistTask.id}:`, error);
       }
     }
-    
+
     if (skippedEmptyTasks > 0) {
       console.log(`  ⚠ Skipped ${skippedEmptyTasks} tasks with empty titles from Todoist`);
     }
-    
+
     return tasks;
   }
 
