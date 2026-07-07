@@ -2,7 +2,7 @@ name: Sync Tasks
 
 on:
    schedule:
-     - cron: '0 * * * *'
+   - cron: '0 * * * *'
   workflow_dispatch:
 
 concurrency:
